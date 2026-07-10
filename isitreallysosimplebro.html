@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pi/3 Invariant Function Plotter</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+            background-color: #f8f9fa;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: white;
+            padding: 10px 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            z-index: 10;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        button {
+            padding: 8px 12px;
+            cursor: pointer;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background: #e9ecef;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover { background: #dee2e6; }
+        #draw-btn.active {
+            background: #4caf50;
+            color: white;
+            border-color: #4caf50;
+        }
+        #status {
+            font-size: 0.9em;
+            color: #666;
+            margin-left: 10px;
+        }
+        canvas {
+            display: block;
+            cursor: grab;
+        }
+        canvas.drawing {
+            cursor: crosshair;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-container">
+        <button id="draw-btn">Draw Mode: OFF</button>
+        <button id="undo-btn">Undo</button>
+        <span id="status">Ready</span>
+    </div>
+
+    <canvas id="mathCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('mathCanvas');
+        const ctx = canvas.getContext('2d');
+        const drawBtn = document.getElementById('draw-btn');
+        const undoBtn = document.getElementById('undo-btn');
+        const statusText = document.getElementById('status');
+
+        // --- State Management ---
+        let width, height;
+        let camera = { x: 0, y: 0, zoom: 1 };
+        let drawMode = false;
+        
+        let strokes = []; // Array of drawn strokes (each stroke is an array of points)
+        let currentStroke = null;
+        let isDrawing = false;
+        let isFrozen = false;
+        
+        let shiftPressed = false;
+        let dragStartMouse = null; 
+        
+        // Mathematical Constants
+        const PI_3 = Math.PI / 3;
+        const X_RESOLUTION = 0.5; // Precision bin for the vertical line test
+        const Y_TOLERANCE = 1.0;  // Allowed variation within the same X bin
+
+        // Collision Map: Maps discrete X values to Y values
+        let functionMap = new Map();
+
+        // --- Initialization ---
+        function resizeCanvas() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            draw();
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // --- Coordinate Transformations ---
+        function screenToWorld(sx, sy) {
+            return {
+                x: camera.x + (sx - width / 2) / camera.zoom,
+                y: camera.y - (sy - height / 2) / camera.zoom
+            };
+        }
+
+        function worldToScreen(wx, wy) {
+            return {
+                x: width / 2 + (wx - camera.x) * camera.zoom,
+                y: height / 2 - (wy - camera.y) * camera.zoom
+            };
+        }
+
+        function rotatePoint(p, angle) {
+            return {
+                x: p.x * Math.cos(angle) - p.y * Math.sin(angle),
+                y: p.x * Math.sin(angle) + p.y * Math.cos(angle)
+            };
+        }
+
+        // --- Core Logic: Vertical Line Test ---
+        function getQuantized(v) {
+            return Math.round(v / X_RESOLUTION) * X_RESOLUTION;
+        }
+
+        function buildFunctionMap() {
+            functionMap.clear();
+            for (let stroke of strokes) {
+                for (let point of stroke) {
+                    registerPointInMap(point);
+                }
+            }
+        }
+
+        function registerPointInMap(p) {
+            for (let k = 0; k < 6; k++) {
+                let rotP = rotatePoint(p, k * PI_3);
+                let qx = getQuantized(rotP.x);
+                functionMap.set(qx, rotP.y);
+            }
+        }
+
+        // Returns true if the point can be placed, false if it violates the function
+        function isValidPoint(p) {
+            for (let k = 0; k < 6; k++) {
+                let rotP = rotatePoint(p, k * PI_3);
+                let qx = getQuantized(rotP.x);
+                
+                if (functionMap.has(qx)) {
+                    let existingY = functionMap.get(qx);
+                    if (Math.abs(existingY - rotP.y) > Y_TOLERANCE) {
+                        return false; // Vertical line test failed!
+                    }
+                }
+            }
+            return true;
+        }
+
+        // --- Event Listeners ---
+        window.addEventListener('keydown', (e) => { if (e.key === 'Shift') shiftPressed = true; });
+        window.addEventListener('keyup', (e) => { if (e.key === 'Shift') shiftPressed = false; });
+
+        drawBtn.addEventListener('click', () => {
+            drawMode = !drawMode;
+            drawBtn.textContent = `Draw Mode: ${drawMode ? 'ON' : 'OFF'}`;
+            drawBtn.className = drawMode ? 'active' : '';
+            canvas.className = drawMode ? 'drawing' : '';
+            statusText.textContent = drawMode ? "Click and drag to draw. Hold shift for lines." : "Click and drag to pan. Scroll to zoom.";
+        });
+
+        undoBtn.addEventListener('click', () => {
+            if (strokes.length > 0) {
+                strokes.pop();
+                buildFunctionMap();
+                draw();
+                statusText.textContent = "Undo successful.";
+            }
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (drawMode) {
+                let worldPt = screenToWorld(e.clientX, e.clientY);
+                if (!isValidPoint(worldPt)) {
+                    statusText.textContent = "Cannot start here: violates function.";
+                    return;
+                }
+                isDrawing = true;
+                isFrozen = false;
+                currentStroke = [worldPt];
+                dragStartMouse = worldPt;
+                registerPointInMap(worldPt);
+                statusText.textContent = "Drawing...";
+                draw();
+            } else {
+                isDrawing = true;
+                dragStartMouse = { x: e.clientX, y: e.clientY, camX: camera.x, camY: camera.y };
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDrawing) return;
+
+            if (drawMode) {
+                if (isFrozen) return;
+
+                let worldPt = screenToWorld(e.clientX, e.clientY);
+                
+                if (shiftPressed) {
+                    // Line mode: check points along the line segment
+                    let steps = Math.max(1, Math.abs(worldPt.x - dragStartMouse.x) / X_RESOLUTION);
+                    let lastValid = currentStroke[currentStroke.length - 1];
+                    let freezeTriggered = false;
+
+                    for (let i = 1; i <= steps; i++) {
+                        let t = i / steps;
+                        let testPt = {
+                            x: dragStartMouse.x + (worldPt.x - dragStartMouse.x) * t,
+                            y: dragStartMouse.y + (worldPt.y - dragStartMouse.y) * t
+                        };
+
+                        if (isValidPoint(testPt)) {
+                            currentStroke.push(testPt);
+                            registerPointInMap(testPt);
+                            lastValid = testPt;
+                        } else {
+                            freezeTriggered = true;
+                            break;
+                        }
+                    }
+                    
+                    if (freezeTriggered) {
+                        isFrozen = true;
+                        statusText.textContent = "FROZEN: Vertical line violation detected.";
+                    }
+                } else {
+                    // Freehand mode
+                    if (isValidPoint(worldPt)) {
+                        currentStroke.push(worldPt);
+                        registerPointInMap(worldPt);
+                    } else {
+                        isFrozen = true;
+                        statusText.textContent = "FROZEN: Vertical line violation detected.";
+                    }
+                }
+                draw();
+            } else {
+                // Pan logic
+                let dx = (e.clientX - dragStartMouse.x) / camera.zoom;
+                let dy = (e.clientY - dragStartMouse.y) / camera.zoom;
+                camera.x = dragStartMouse.camX - dx;
+                camera.y = dragStartMouse.camY + dy;
+                draw();
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            if (drawMode && isDrawing && currentStroke) {
+                strokes.push(currentStroke);
+                currentStroke = null;
+                if (!isFrozen) statusText.textContent = "Sequence finished.";
+            }
+            isDrawing = false;
+            isFrozen = false;
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const zoomAmount = 0.1;
+            if (e.deltaY < 0) camera.zoom *= (1 + zoomAmount);
+            else camera.zoom *= (1 - zoomAmount);
+            draw();
+        });
+
+        // --- Rendering ---
+        function draw() {
+            ctx.clearRect(0, 0, width, height);
+
+            // Draw Cartesian Grid
+            ctx.lineWidth = 1;
+            
+            // Grid lines
+            ctx.strokeStyle = '#e0e0e0';
+            ctx.beginPath();
+            let startX = screenToWorld(0, 0).x;
+            let endX = screenToWorld(width, 0).x;
+            let startY = screenToWorld(0, height).y;
+            let endY = screenToWorld(0, 0).y;
+
+            for (let x = Math.floor(startX / 10) * 10; x < endX; x += 10) {
+                let sx = worldToScreen(x, 0).x;
+                ctx.moveTo(sx, 0);
+                ctx.lineTo(sx, height);
+            }
+            for (let y = Math.floor(startY / 10) * 10; y < endY; y += 10) {
+                let sy = worldToScreen(0, y).y;
+                ctx.moveTo(0, sy);
+                ctx.lineTo(width, sy);
+            }
+            ctx.stroke();
+
+            // Axes
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            let origin = worldToScreen(0, 0);
+            if (origin.x > 0 && origin.x < width) { ctx.moveTo(origin.x, 0); ctx.lineTo(origin.x, height); }
+            if (origin.y > 0 && origin.y < height) { ctx.moveTo(0, origin.y); ctx.lineTo(width, origin.y); }
+            ctx.stroke();
+
+            // Draw Strokes and their Rotations
+            let allStrokes = currentStroke ? strokes.concat([currentStroke]) : strokes;
+
+            for (let stroke of allStrokes) {
+                if (stroke.length === 0) continue;
+
+                // Draw the 6 rotations
+                for (let k = 0; k < 6; k++) {
+                    ctx.beginPath();
+                    // Color the original sequence black, and the 5 clones blue for clarity
+                    ctx.strokeStyle = (k === 0) ? '#000000' : 'rgba(0, 102, 204, 0.6)';
+                    ctx.lineWidth = 2;
+                    
+                    for (let i = 0; i < stroke.length; i++) {
+                        let pt = rotatePoint(stroke[i], k * PI_3);
+                        let sPt = worldToScreen(pt.x, pt.y);
+                        if (i === 0) ctx.moveTo(sPt.x, sPt.y);
+                        else ctx.lineTo(sPt.x, sPt.y);
+                    }
+                    ctx.stroke();
+                }
+            }
+        }
+    </script>
+</body>
+</html>
